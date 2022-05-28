@@ -16,7 +16,7 @@ func TestLockFreeQueue(t *testing.T) {
 				t.Fatalf("[LockFreeQueue] failed, get null element in the queue")
 			}
 			if val.(int) != i {
-				t.Fatalf("[LockFreeQueue] failed, get wrong element(%v) in the queue, should be (%d)", v, i)
+				t.Fatalf("[LockFreeQueue] failed, get wrong element(%v) in the queue, should be (%d)", val, i)
 			}
 		}
 	})

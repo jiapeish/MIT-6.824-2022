@@ -19,7 +19,7 @@ type Node struct {
 
 // NewLockFreeQueue creates an queue
 func NewLockFreeQueue() *LockFreeQueue {
-	node := &Node{}
+	node := unsafe.Pointer(&Node{})
 	return &LockFreeQueue{
 		Head: node,
 		Tail: node,
@@ -31,20 +31,20 @@ func NewLockFreeQueue() *LockFreeQueue {
 func (lfq *LockFreeQueue) Enqueue(v interface{}) {
 	node := &Node{Val: v}
 	for {
-		tail := (*Node)(atomic.LoadPointer(&lfq.Tail))
-		next := (*Node)(atomic.LoadPointer(&tail.Next))
-		if tail == (*Node)(atomic.LoadPointer(&lfq.Tail)) { // Are tail and next consistent?
+		tail := Load(&lfq.Tail)
+		next := Load(&tail.Next)
+		if tail == Load(&lfq.Tail) { // Are tail and next consistent?
 			// Was Tail pointing to the last node?
 			if next == nil {
 				// Try to link node at the end of the linked list
-				if atomic.CompareAndSwapPointer(&tail.Next, next, node) {
-					atomic.CompareAndSwapPointer(&lfq.Tail, tail, node) // Enqueue is done.  Try to swing Tail to the inserted node
+				if CAS(&tail.Next, next, node) {
+					CAS(&lfq.Tail, tail, node) // Enqueue is done.  Try to swing Tail to the inserted node
 					atomic.AddInt32(&lfq.Size, 1)
 					return // Enqueue is done.  Exit loop
 				}
 			} else { // Tail was not pointing to the last node
 				// Try to swing Tail to the next node
-				atomic.CompareAndSwapPointer(&lfq.Tail, tail, next)
+				CAS(&lfq.Tail, tail, next)
 			}
 		}
 	}
@@ -53,22 +53,22 @@ func (lfq *LockFreeQueue) Enqueue(v interface{}) {
 // Dequeue pop value from the head of the queue.
 func (lfq *LockFreeQueue) Dequeue() interface{} {
 	for {
-		head := (*Node)(atomic.LoadPointer(&lfq.Head))
-		tail := (*Node)(atomic.LoadPointer(&lfq.Tail))
-		next := (*Node)(atomic.LoadPointer(&head.Next))
-		if head == (*Node)(atomic.LoadPointer(&lfq.Head)) { // Are head, tail, and next consistent?
+		head := Load(&lfq.Head)
+		tail := Load(&lfq.Tail)
+		next := Load(&head.Next)
+		if head == Load(&lfq.Head) { // Are head, tail, and next consistent?
 			if head == tail { // Is queue empty or Tail falling behind?
 				if next == nil { // Is queue empty?
 					return nil
 				}
 				// Tail is falling behind.  Try to advance it
-				atomic.CompareAndSwapPointer(&lfq.Tail, tail, next)
+				CAS(&lfq.Tail, tail, next)
 			} else { // No need to deal with Tail
 				// Read value before CAS
 				// Otherwise, another dequeue might free the next node
 				v := next.Val
 				// Try to swing Head to the next node
-				if atomic.CompareAndSwapPointer(&lfq.Head, head, next) {
+				if CAS(&lfq.Head, head, next) {
 					// Queue was not empty, dequeue succeeded
 					atomic.AddInt32(&lfq.Size, -1)
 					return v // Dequeue is done.  Exit loop
@@ -76,4 +76,12 @@ func (lfq *LockFreeQueue) Dequeue() interface{} {
 			}
 		}
 	}
+}
+
+func Load(p *unsafe.Pointer) *Node {
+	return (*Node)(atomic.LoadPointer(p))
+}
+
+func CAS(p *unsafe.Pointer, old, new *Node) (ok bool) {
+	return atomic.CompareAndSwapPointer(p, unsafe.Pointer(old), unsafe.Pointer(new))
 }

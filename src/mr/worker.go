@@ -30,7 +30,7 @@ const (
 
 type WorkerNode struct {
 	role      int32
-	wid       int
+	wid       int32
 	completed chan struct{}
 	// done is closed when all task has been completed
 	done chan struct{}
@@ -112,13 +112,13 @@ func (w *WorkerNode) executeMap(reply *MapReply) {
 }
 
 func (w *WorkerNode) RequestMapTask() *MapReply {
-	args := MapArgs{Wid: w.wid}
+	args := MapArgs{Wid: int(atomic.LoadInt32(&w.wid))}
 	reply := MapReply{}
 
 	Printf(w.prefix, "prepare to request map task...\n")
 	call("Coordinator.AssignMapTask", &args, &reply)
 
-	w.wid = reply.Wid
+	atomic.StoreInt32(&w.wid, int32(reply.Wid))
 	if reply.Completed {
 		Printf(w.prefix, "map tasks completed\n")
 		return nil
@@ -174,7 +174,7 @@ func (w *WorkerNode) MapProcess(reply *MapReply) {
 func (w *WorkerNode) ReportMapTaskStatus(fid int) {
 	args := MapStatusArgs{
 		Fid: fid,
-		Wid: w.wid,
+		Wid: int(atomic.LoadInt32(&w.wid)),
 	}
 	reply := MapStatusReply{}
 
@@ -221,10 +221,10 @@ func (w *WorkerNode) executeReduce(reply *ReduceReply) {
 }
 
 func (w *WorkerNode) RequestReduceTask() *ReduceReply {
-	args := ReduceArgs{Wid: w.wid}
+	args := ReduceArgs{Wid: int(atomic.LoadInt32(&w.wid))}
 	reply := ReduceReply{}
 
-	Printf(w.prefix, "id(%d) requests for a reduce task\n", w.wid)
+	Printf(w.prefix, "id(%d) requests for a reduce task\n", atomic.LoadInt32(&w.wid))
 	call("Coordinator.AssignReduceTask", &args, &reply)
 
 	if reply.Completed {
@@ -312,7 +312,7 @@ func (w *WorkerNode) remoteReadIntermediates(fileId int, reduceId int) []KeyValu
 
 func (w *WorkerNode) ReportReduceTaskStatus(id int) {
 	args := ReduceStatusArgs{
-		Wid:      w.wid,
+		Wid:      int(atomic.LoadInt32(&w.wid)),
 		IdReduce: id,
 	}
 	reply := ReduceStatusReply{}

@@ -55,38 +55,37 @@ type Coordinator struct {
 
 // Your code here -- RPC handlers for the worker to call.
 func (c *Coordinator) AssignMapTask(args *MapArgs, reply *MapReply) error {
-	reply.Wid = args.Wid
-	if reply.Wid == InvalidWorkerId {
-		reply.Wid = int(atomic.LoadInt32(&c.counter)) // simply allocate
-		atomic.AddInt32(&c.counter, 1)
-	}
-	Printf(c.prefix, "worker(%v) requests for a map task\n", reply.Wid)
+	c.setWorkerId(args, reply)
 
-	c.mMu.Lock()
-	if c.mapDone {
-		c.mMu.Unlock()
-		setFlag(reply)
+	if c.getDone() {
+		c.setMapCompleted(reply)
 		return nil
 	}
 
 	if c.idleMapTasks.Len() == 0 && c.runningMapTasks.Len() == 0 {
-		c.mapDone = true
-		c.mMu.Unlock()
-		setFlag(reply)
+		c.setDone()
+		c.setMapCompleted(reply)
 		c.shuffleTasks()
 		return nil
 	}
 	Printf(c.prefix, "map tasks status: idle(%d) running(%d)\n", c.idleMapTasks.Len(), c.runningMapTasks.Len())
-	c.mMu.Unlock() // release lock to allow idle update
 
+	reply.Fid, reply.Filename = c.getMapFileInfo(reply)
+	reply.Completed = false
+	reply.NReduce = c.nReduce
+
+	return nil
+}
+
+func (c *Coordinator) getMapFileInfo(reply *MapReply) (int, string) {
 	now := time.Now()
+	fileId, fileName := InvalidFileId, ""
 
-	fileId := InvalidFileId
 	value := c.idleMapTasks.PopFront()
 	if value != nil {
 		fileId = value.(int)
 		c.mMu.Lock()
-		reply.Filename = c.files[fileId]
+		fileName = c.files[fileId]
 		c.mts[fileId].start = now
 		c.mts[fileId].wid = reply.Wid
 		c.runningMapTasks.Add(fileId)
@@ -94,12 +93,29 @@ func (c *Coordinator) AssignMapTask(args *MapArgs, reply *MapReply) error {
 
 		Printf(c.prefix, "add map task(%d-%s-%s) to running set\n", fileId, reply.Filename, now.String())
 	}
+	return fileId, fileName
+}
 
-	reply.Fid = fileId
-	reply.Completed = false
-	reply.NReduce = c.nReduce
+func (c *Coordinator) setDone() {
+	c.mMu.Lock()
+	c.mapDone = true
+	c.mMu.Unlock()
+}
 
-	return nil
+func (c *Coordinator) getDone() bool {
+	c.mMu.Lock()
+	done := c.mapDone
+	c.mMu.Unlock()
+	return done
+}
+
+func (c *Coordinator) setWorkerId(args *MapArgs, reply *MapReply) {
+	reply.Wid = args.Wid
+	if reply.Wid == InvalidWorkerId {
+		reply.Wid = int(atomic.LoadInt32(&c.counter))
+		atomic.AddInt32(&c.counter, 1)
+	}
+	Printf(c.prefix, "worker(%v) requests for a map task\n", reply.Wid)
 }
 
 func (c *Coordinator) HandleMapTaskStatus(args *MapStatusArgs, reply *MapStatusReply) error {
@@ -121,11 +137,11 @@ func (c *Coordinator) HandleMapTaskStatus(args *MapStatusArgs, reply *MapStatusR
 	}
 
 	if time.Now().Sub(c.mts[args.Fid].start) > Timeout {
-		log.Println("task exceeds max wait time, abadoning...")
+		Printf(c.prefix, "map task running failed, timeout, push to idle queue to re-exec")
 		reply.Committed = false
 		c.idleMapTasks.PushBack(args.Fid)
 	} else {
-		log.Println("task within max wait time, accepting...")
+		Printf(c.prefix, "map task running success, coordinator committed, remove from running queue")
 		reply.Committed = true
 		c.runningMapTasks.Remove(args.Fid)
 	}
@@ -249,10 +265,10 @@ func (c *Coordinator) reExecReduceTasks(s *set.Set, rts []ReduceTask, q *queue.L
 	c.rMu.Unlock()
 }
 
-func setFlag(reply *MapReply) {
-	log.Println("all map tasks complete, telling workers to switch to reduce mode")
+func (c *Coordinator) setMapCompleted(reply *MapReply) {
 	reply.Fid = -1
 	reply.Completed = true
+	log.Println("all map tasks complete, telling workers to switch to reduce mode")
 }
 
 func Printf(prefix string, format string, v ...interface{}) {

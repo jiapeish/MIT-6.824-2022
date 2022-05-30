@@ -249,14 +249,14 @@ func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 func (w *WorkerNode) ReduceProcess(reply *ReduceReply, reducef func(string, []string) string) error {
 	var intermediate []KeyValue
 	for i := 0; i < reply.NFile; i++ {
-		Printf(w.prefix, "reduce process flow, producing intermediates for file(%d)\n", i)
+		Printf(w.prefix, "reduce process flow(%d), producing intermediates for file(%d)\n", reply.IdReduce, i)
 		intermediate = append(intermediate, w.remoteReadIntermediates(i, reply.IdReduce)...)
 	}
-	Printf(w.prefix, "reduce process flow, produced (%d) intermediate key/value pairs\n", len(intermediate))
+	Printf(w.prefix, "reduce process flow(%d), produced (%d) intermediate key/value pairs\n", reply.IdReduce, len(intermediate))
 
 	temp, err := os.CreateTemp(".", "mr-temp")
 	if err != nil {
-		Printf(w.prefix, "reduce process flow, cannot create temp for %v\n", reply.IdReduce)
+		Printf(w.prefix, "reduce process flow(%d), create temp failed(%v)\n", reply.IdReduce, err)
 		return err
 	}
 	defer temp.Close()
@@ -282,7 +282,7 @@ func (w *WorkerNode) ReduceProcess(reply *ReduceReply, reducef func(string, []st
 	final := fmt.Sprintf("mr-out-%v", reply.IdReduce)
 	err = os.Rename(temp.Name(), final)
 	if err != nil {
-		Printf(w.prefix, "rename temp failed for %v\n", final)
+		Printf(w.prefix, "reduce process flow(%d), rename temp failed(%v)\n", reply.IdReduce, err)
 		return err
 	}
 

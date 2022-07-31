@@ -18,9 +18,12 @@ package raft
 //
 
 import (
+	"math/rand"
 	//	"bytes"
 	"sync"
 	"sync/atomic"
+	"time"
+
 	//	"6.824/labgob"
 	"6.824/labrpc"
 )
@@ -50,7 +53,8 @@ type ApplyMsg struct {
 
 // these are some const
 const (
-	InvalidId = -1
+	InvalidId               = -1
+	DefaultHeartbeatTimeout = 100 * time.Millisecond
 )
 
 // StateType represents the role of a node in a cluster.
@@ -80,12 +84,12 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// RSM states:
-	state            StateType
-	TickMs           uint
-	heartbeatTimeout int
-	electionTimeout  int
-	heartbeatElapsed int
-	electionElapsed  int
+	state StateType
+	//TickMs           uint
+	heartbeatTimeout          time.Duration
+	randomizedElectionTimeout time.Time
+	//heartbeatElapsed int
+	//electionElapsed  int
 
 	// Figure 2: State
 	// Persistent state on all servers:
@@ -245,7 +249,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = rf.votedFor == args.CandidateId
-	DebugLog(dLog, "S%d T:%d, request vote reply T:%d voted:%v",
+	DebugLog(dInfo, "S%d T:%d, request vote reply T:%d voted:%v",
 		rf.me, rf.currentTerm, reply.Term, reply.VoteGranted)
 }
 
@@ -344,10 +348,19 @@ func (rf *Raft) killed() bool {
 // heartbeats recently.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
+		time.Sleep(rf.heartbeatTimeout) // todo randomized?
+
+		rf.mu.Lock()
+		if rf.state == StateLeader {
+			rf.appendEntry()
+		}
+		if time.Now().After(rf.randomizedElectionTimeout) {
+			rf.campaign()
+		}
+		rf.mu.Unlock()
 
 	}
 }
@@ -371,6 +384,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	DebugLog(dInfo, "S%d created", me)
+	rf.updateTerm(0)
+	rf.heartbeatTimeout = DefaultHeartbeatTimeout
+	rf.resetRandomizedElectionTimeout()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -379,4 +396,143 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 
 	return rf
+}
+
+func (rf *Raft) resetRandomizedElectionTimeout() {
+	timeout := time.Duration(1000+rand.Intn(1000)) * time.Millisecond
+	rf.randomizedElectionTimeout = time.Now().Add(timeout)
+}
+
+func (rf *Raft) campaign() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock() // todo
+	rf.currentTerm++
+	rf.state = StateCandidate
+	rf.votedFor = rf.me
+	rf.resetRandomizedElectionTimeout()
+	term := rf.currentTerm
+	voteCounter := 1
+	completed := false
+	DebugLog(dInfo, "S%d create campaign, T:%d", rf.me, term)
+
+	for peer, _ := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+
+		go func(to int) {
+			DebugLog(dVote, "S%d asking for vote to S%d at T:%d", rf.me, to, term)
+			args := RequestVoteArgs{
+				Term:        term,
+				CandidateId: rf.me,
+			}
+			reply := RequestVoteReply{}
+			ok := rf.sendRequestVote(to, &args, &reply)
+			if !ok {
+				DebugLog(dError, "S%d send vote to S%d failed", rf.me, to)
+				return
+			}
+
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			DebugLog(dInfo, "S%d T:%d receive vote-reply from S%d T:%d",
+				rf.me, term, to, reply.Term)
+			if !reply.VoteGranted {
+				DebugLog(dVote, "S%d reject vote to S%d", to, rf.me)
+				return
+			}
+			if reply.Term < term {
+				DebugLog(dVote, "S%d T:%d got stale vote from S%d T:%d",
+					rf.me, term, to, reply.Term)
+				return
+			}
+			if reply.Term > term {
+				DebugLog(dVote, "S%d T:%d grant vote to S%d T:%d, update term",
+					to, reply.Term, rf.me, term)
+				rf.updateTerm(reply.Term)
+				return // todo return or not, how to wait every goroutine finish?
+			}
+			DebugLog(dVote, "S%d T:%d grant vote to S%d T:%d",
+				to, reply.Term, rf.me, term)
+
+			voteCounter++
+
+			// todo correct?
+			if completed || voteCounter <= len(rf.peers)/2 {
+				DebugLog(dVote, "S%d got %d votes, finish", rf.me, voteCounter)
+				return
+			}
+			DebugLog(dVote, "S%d got quorum %d votes", rf.me, voteCounter)
+			completed = true
+			if term != rf.currentTerm || rf.state != StateCandidate {
+				DebugLog(dWarn, "S%d T:[old:%d, now:%d] state:%d",
+					rf.me, term, rf.currentTerm, rf.state)
+				return
+			}
+
+			rf.state = StateLeader
+			DebugLog(dLeader, "S%d achieved majority for T%d(%d), convert to Leader(%d)",
+				rf.me, rf.currentTerm, voteCounter, rf.state)
+		}(peer)
+
+	}
+}
+
+func (rf *Raft) appendEntry() {
+	rf.mu.Lock()
+	term := rf.currentTerm
+	rf.mu.Unlock()
+	args := RequestVoteArgs{ // todo use entry args
+		Term:        term,
+		CandidateId: rf.me,
+	}
+	reply := RequestVoteReply{} // todo use entry reply
+	failures := 1
+	completed := true
+	DebugLog(dInfo, "S%d Leader, state %d", rf.me, rf.state)
+
+	for peer, _ := range rf.peers {
+		if peer == rf.me {
+			rf.resetRandomizedElectionTimeout() // todo check need or not?
+			continue
+		}
+
+		go func(to int) {
+			ok := rf.sendEntry(to, &args, &reply)
+			if !ok {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				failures++
+				if completed || failures <= len(rf.peers)/2 {
+					DebugLog(dError, "S%d lost connections with %d peers",
+						rf.me, failures)
+					return
+				}
+				completed = true
+				rf.state = StateFollower
+			}
+		}(peer)
+	}
+}
+
+// todo use append entry args and reply
+func (rf *Raft) AppendEntry(args *RequestVoteArgs, reply *RequestVoteReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	DebugLog(dInfo, "S%d T:%d receive HBT from S%d T:%d",
+		rf.me, rf.currentTerm, args.CandidateId, args.Term)
+	if args.Term < rf.currentTerm {
+		DebugLog(dDrop, "S%d drop HBT from S%d", rf.me, args.CandidateId)
+		return
+	}
+
+	rf.updateTerm(args.Term)
+	DebugLog(dInfo, "S%d T:%d received HBT from S%d T:%d, term updated",
+		rf.me, rf.currentTerm, args.CandidateId, args.Term)
+}
+
+func (rf *Raft) sendEntry(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntry", args, reply)
+	return ok
 }

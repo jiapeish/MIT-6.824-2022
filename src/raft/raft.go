@@ -21,7 +21,6 @@ import (
 	//	"bytes"
 	"sync"
 	"sync/atomic"
-
 	//	"6.824/labgob"
 	"6.824/labrpc"
 )
@@ -48,6 +47,11 @@ type ApplyMsg struct {
 	SnapshotTerm  int
 	SnapshotIndex int
 }
+
+// these are some const
+const (
+	InvalidId = -1
+)
 
 // StateType represents the role of a node in a cluster.
 type StateType uint64
@@ -104,10 +108,20 @@ type Raft struct {
 // GetState returns currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	term = rf.currentTerm
+	isleader = rf.state == StateLeader
+	rf.mu.Unlock()
+
+	if isleader {
+		DebugLog(dInfo, "S%d Leader, at T:%d", rf.me, term)
+	} else {
+		DebugLog(dInfo, "S%d Follower: at T:%d", rf.me, term)
+	}
+
 	return term, isleader
 }
 
@@ -175,6 +189,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	// Figure 2: Request RPC:
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // RequestVoteReply is for:
@@ -183,6 +202,9 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	// Figure 2: Request RPC:
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -190,6 +212,53 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// Figure 2, RequestVote RPC, Receive implementation:
+	// Rule 1.
+	if args.Term < rf.currentTerm {
+		reply.VoteGranted = false
+		DebugLog(dDrop, "S%d T:%d, reject stale request T:%d",
+			rf.me, rf.currentTerm, args.Term)
+		return
+	}
+
+	if args.Term == rf.currentTerm {
+		if rf.votedFor == InvalidId {
+			rf.votedFor = args.CandidateId
+			DebugLog(dVote, "S%d T:%d, vote for S%d T:%d",
+				rf.me, rf.currentTerm, args.CandidateId, args.Term)
+		} else {
+			DebugLog(dVote, "S%d T:%d, already voted for S%d, reject S%d T:%d",
+				rf.me, rf.currentTerm, rf.votedFor, args.CandidateId, args.Term)
+		}
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.updateTerm(args.Term)
+		old := rf.votedFor
+		rf.votedFor = args.CandidateId
+		DebugLog(dVote, "S%d T:%d, change vote from S%d to S%d T:%d",
+			rf.me, rf.currentTerm, old, args.CandidateId, args.Term)
+	}
+
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = rf.votedFor == args.CandidateId
+	DebugLog(dLog, "S%d T:%d, request vote reply T:%d voted:%v",
+		rf.me, rf.currentTerm, reply.Term, reply.VoteGranted)
+}
+
+func (rf *Raft) updateTerm(term int) {
+	if term < rf.currentTerm {
+		return
+	}
+
+	old := rf.currentTerm
+	rf.currentTerm = term
+	rf.state = StateFollower
+	rf.votedFor = InvalidId
+	DebugLog(dTerm, "S%d update T:%d -> T:%d", rf.me, old, rf.currentTerm)
 }
 
 //

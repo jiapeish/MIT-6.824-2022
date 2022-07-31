@@ -26,8 +26,7 @@ import (
 	"6.824/labrpc"
 )
 
-
-//
+// ApplyMsg is for:
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -50,7 +49,19 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
-//
+// StateType represents the role of a node in a cluster.
+type StateType uint64
+
+// Possible values for StateType.
+const (
+	StateFollower StateType = iota
+	StateCandidate
+	StateLeader
+
+	numStates
+)
+
+// Raft is for:
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
@@ -64,9 +75,33 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// RSM states:
+	state            StateType
+	TickMs           uint
+	heartbeatTimeout int
+	electionTimeout  int
+	heartbeatElapsed int
+	electionElapsed  int
+
+	// Figure 2: State
+	// Persistent state on all servers:
+	currentTerm int
+	votedFor    int
+	log         raftLog
+
+	// Volatile state on all servers:
+	commitIndex int
+	lastApplied int
+
+	// Volatile state on leaders:
+	nextIndex  []int
+	matchIndex []int
+
+	// Others:
+
 }
 
-// return currentTerm and whether this server
+// GetState returns currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
@@ -92,7 +127,6 @@ func (rf *Raft) persist() {
 	// rf.persister.SaveRaftState(data)
 }
 
-
 //
 // restore previously persisted state.
 //
@@ -115,8 +149,7 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-//
+// CondInstallSnapshot is for:
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
 //
@@ -127,7 +160,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	return true
 }
 
-// the service says it has created a snapshot that has
+// Snapshot is for: the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
@@ -136,8 +169,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
-//
+// RequestVoteArgs is for:
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
@@ -145,7 +177,7 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 }
 
-//
+// RequestVoteReply is for:
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 //
@@ -154,7 +186,7 @@ type RequestVoteReply struct {
 }
 
 //
-// example RequestVote RPC handler.
+// RequestVote RPC handler example.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
@@ -194,8 +226,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
-//
+// Start is used for:
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -216,11 +247,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 
-
 	return index, term, isLeader
 }
 
-//
+// Kill is used for:
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the
@@ -242,7 +272,7 @@ func (rf *Raft) killed() bool {
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
-// heartsbeats recently.
+// heartbeats recently.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 
@@ -253,7 +283,7 @@ func (rf *Raft) ticker() {
 	}
 }
 
-//
+// Make is used for:
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -278,7 +308,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 
 	return rf
 }

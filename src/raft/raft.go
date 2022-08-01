@@ -357,7 +357,7 @@ func (rf *Raft) ticker() {
 
 		rf.mu.Lock()
 		if rf.state == StateLeader {
-			rf.appendEntry()
+			rf.handleAppendEntries()
 		}
 		if time.Now().After(rf.randomizedElectionTimeout) {
 			rf.campaign()
@@ -410,83 +410,89 @@ func (rf *Raft) campaign() {
 	rf.state = StateCandidate
 	rf.votedFor = rf.me
 	rf.resetRandomizedElectionTimeout()
-	term := rf.currentTerm
+
 	voteCounter := 1
 	completed := false
-	DebugLog(dInfo, "S%d create campaign, T:%d", rf.me, term)
+	args := RequestVoteArgs{
+		Term:        rf.currentTerm,
+		CandidateId: rf.me,
+	}
+	DebugLog(dInfo, "S%d create campaign, T:%d", rf.me, rf.currentTerm)
 
 	for peer, _ := range rf.peers {
 		if peer == rf.me {
 			continue
 		}
 
-		go func(to int) {
-			DebugLog(dVote, "S%d asking for vote to S%d at T:%d", rf.me, to, term)
-			args := RequestVoteArgs{
-				Term:        term,
-				CandidateId: rf.me,
-			}
-			reply := RequestVoteReply{}
-			ok := rf.sendRequestVote(to, &args, &reply)
-			if !ok {
-				DebugLog(dError, "S%d send vote to S%d failed", rf.me, to)
-				return
-			}
-
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
-
-			DebugLog(dInfo, "S%d T:%d receive vote-reply from S%d T:%d",
-				rf.me, term, to, reply.Term)
-			if !reply.VoteGranted {
-				DebugLog(dVote, "S%d reject vote to S%d", to, rf.me)
-				return
-			}
-			if reply.Term < term {
-				DebugLog(dVote, "S%d T:%d got stale vote from S%d T:%d",
-					rf.me, term, to, reply.Term)
-				return
-			}
-			if reply.Term > term {
-				DebugLog(dVote, "S%d T:%d grant vote to S%d T:%d, update term",
-					to, reply.Term, rf.me, term)
-				rf.updateTerm(reply.Term)
-				return // todo return or not, how to wait every goroutine finish?
-			}
-			DebugLog(dVote, "S%d T:%d grant vote to S%d T:%d",
-				to, reply.Term, rf.me, term)
-
-			voteCounter++
-
-			// todo correct?
-			if completed || voteCounter <= len(rf.peers)/2 {
-				DebugLog(dVote, "S%d got %d votes, finish", rf.me, voteCounter)
-				return
-			}
-			DebugLog(dVote, "S%d got quorum %d votes", rf.me, voteCounter)
-			completed = true
-			if term != rf.currentTerm || rf.state != StateCandidate {
-				DebugLog(dWarn, "S%d T:[old:%d, now:%d] state:%d",
-					rf.me, term, rf.currentTerm, rf.state)
-				return
-			}
-
-			rf.state = StateLeader
-			DebugLog(dLeader, "S%d achieved majority for T%d(%d), convert to Leader(%d)",
-				rf.me, rf.currentTerm, voteCounter, rf.state)
-		}(peer)
-
+		go rf.poll(peer, &args, &voteCounter, &completed)
 	}
 }
 
-func (rf *Raft) appendEntry() {
+func (rf *Raft) poll(to int, args *RequestVoteArgs, voteCounter *int, completed *bool) {
+	DebugLog(dVote, "S%d asking for vote to S%d at T:%d", rf.me, to, args.Term)
+
+	var reply RequestVoteReply
+	ok := rf.sendRequestVote(to, args, &reply)
+	if !ok {
+		DebugLog(dError, "S%d send vote to S%d failed", rf.me, to)
+		return
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	DebugLog(dInfo, "S%d T:%d receive vote-reply from S%d T:%d",
+		rf.me, args.Term, to, reply.Term)
+	if !reply.VoteGranted {
+		DebugLog(dVote, "S%d reject vote to S%d", to, rf.me)
+		return
+	}
+	if reply.Term < args.Term {
+		DebugLog(dVote, "S%d T:%d got stale vote from S%d T:%d",
+			rf.me, args.Term, to, reply.Term)
+		return
+	}
+	if reply.Term > args.Term {
+		DebugLog(dVote, "S%d T:%d grant vote to S%d T:%d, update term",
+			to, reply.Term, rf.me, args.Term)
+		rf.updateTerm(reply.Term)
+		return // todo return or not, how to wait every goroutine finish?
+	}
+	DebugLog(dVote, "S%d T:%d grant vote to S%d T:%d",
+		to, reply.Term, rf.me, args.Term)
+
+	*voteCounter++
+
+	if *voteCounter <= len(rf.peers)/2 {
+		DebugLog(dVote, "S%d got %d votes, not reach quorum yet", rf.me, voteCounter)
+		return
+	}
+	if *completed {
+		DebugLog(dVote, "S%d got %d votes, finish", rf.me, voteCounter)
+		return
+	}
+
+	DebugLog(dVote, "S%d got quorum %d votes", rf.me, voteCounter)
+	*completed = true
+
+	if args.Term != rf.currentTerm || rf.state != StateCandidate {
+		DebugLog(dWarn, "S%d T:[old:%d, now:%d] state:%d",
+			rf.me, args.Term, rf.currentTerm, rf.state)
+		return
+	}
+
+	rf.state = StateLeader
+	DebugLog(dLeader, "S%d achieved majority for T%d(%d), convert to Leader(%d)",
+		rf.me, rf.currentTerm, voteCounter, rf.state)
+}
+
+func (rf *Raft) handleAppendEntries() {
 	term := rf.currentTerm
 	args := RequestVoteArgs{ // todo use entry args
 		Term:        term,
 		CandidateId: rf.me,
 	}
-	reply := RequestVoteReply{} // todo use entry reply
-	failures := 1
+	failures := 0
 	completed := true
 	DebugLog(dInfo, "S%d Leader, state %d", rf.me, rf.state)
 
@@ -496,21 +502,30 @@ func (rf *Raft) appendEntry() {
 			continue
 		}
 
-		go func(to int) {
-			ok := rf.sendEntry(to, &args, &reply)
-			if !ok {
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-				failures++
-				if completed || failures <= len(rf.peers)/2 {
-					DebugLog(dError, "S%d lost connections with %d peers",
-						rf.me, failures)
-					return
-				}
-				completed = true
-				rf.state = StateFollower
-			}
-		}(peer)
+		go rf.tryAppendEntry(peer, &args, &failures, &completed)
+	}
+}
+
+func (rf *Raft) tryAppendEntry(to int, args *RequestVoteArgs, failures *int, completed *bool) {
+	var reply RequestVoteReply // todo use entry reply
+
+	ok := rf.sendEntry(to, args, &reply)
+	if !ok {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		*failures++
+		if *failures <= len(rf.peers)/2 {
+			DebugLog(dError, "S%d lost connections with %d peers, it's ok",
+				rf.me, failures)
+			return
+		}
+		if *completed {
+			DebugLog(dError, "S%d lost connections with %d peers, already known",
+				rf.me, failures)
+			return
+		}
+		*completed = true
+		rf.state = StateFollower
 	}
 }
 

@@ -232,6 +232,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term == rf.currentTerm {
 		if rf.votedFor == InvalidId {
 			rf.votedFor = args.CandidateId
+			rf.resetRandomizedElectionTimeout() // necessary, or 2A warning term changed
 			DebugLog(dVote, "S%d T:%d, vote for S%d T:%d",
 				rf.me, rf.currentTerm, args.CandidateId, args.Term)
 		} else {
@@ -255,7 +256,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) updateTerm(term int) {
-	if term < rf.currentTerm {
+	if term <= rf.currentTerm {
 		return
 	}
 
@@ -525,6 +526,7 @@ func (rf *Raft) AppendEntry(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	rf.updateTerm(args.Term)
+	rf.resetRandomizedElectionTimeout() // necessary, or 2A warning term changed
 	DebugLog(dInfo, "S%d T:%d received HBT from S%d T:%d, term updated",
 		rf.me, rf.currentTerm, args.CandidateId, args.Term)
 }

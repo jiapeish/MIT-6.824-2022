@@ -118,12 +118,13 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	term = rf.currentTerm
 	isleader = rf.state == StateLeader
+	me := rf.me // for debug only
 	rf.mu.Unlock()
 
 	if isleader {
-		DebugLog(dInfo, "S%d Leader, at T:%d", rf.me, term)
+		DebugLog(dInfo, "S%d Leader, at T:%d", me, term)
 	} else {
-		DebugLog(dInfo, "S%d Follower: at T:%d", rf.me, term)
+		DebugLog(dInfo, "S%d Follower: at T:%d", me, term)
 	}
 
 	return term, isleader
@@ -404,8 +405,6 @@ func (rf *Raft) resetRandomizedElectionTimeout() {
 }
 
 func (rf *Raft) campaign() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock() // todo
 	rf.currentTerm++
 	rf.state = StateCandidate
 	rf.votedFor = rf.me
@@ -480,9 +479,7 @@ func (rf *Raft) campaign() {
 }
 
 func (rf *Raft) appendEntry() {
-	rf.mu.Lock()
 	term := rf.currentTerm
-	rf.mu.Unlock()
 	args := RequestVoteArgs{ // todo use entry args
 		Term:        term,
 		CandidateId: rf.me,

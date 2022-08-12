@@ -106,7 +106,7 @@ def run_test(test: str, race: bool, timing: bool):
     if race:
         test_cmd.append("-race")
     if timing:
-        test_cmd = ["time"] + cmd
+        test_cmd = ["time"] + test_cmd
     f, path = tempfile.mkstemp()
     start = time.time()
     proc = subprocess.run(test_cmd, stdout=f, stderr=f)

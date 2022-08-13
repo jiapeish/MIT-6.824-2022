@@ -56,5 +56,5 @@ type Entry struct {
 }
 
 func (e *Entry) String() string {
-	return fmt.Sprintf("Term=%d, Index=%d", e.Term, e.Index)
+	return fmt.Sprintf("(T:%d|I:%d|Cmd:%v)", e.Term, e.Index, e.Command)
 }

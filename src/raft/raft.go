@@ -537,6 +537,17 @@ type AppendEntriesArgs struct {
 	LeaderCommit int
 }
 
+func (a AppendEntriesArgs) String() string {
+	var ents []string
+	for _, e := range a.Entries {
+		ents = append(ents, e.String())
+	}
+	entries := strings.Join(ents, ",")
+
+	return fmt.Sprintf("AEArg[Leader:%d, T:%d, PLI:%d, PLT:%d, LCI:%d, Ents:%s]",
+		a.LeaderId, a.Term, a.PrevLogIndex, a.PrevLogTerm, a.LeaderCommit, entries)
+}
+
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
@@ -698,17 +709,79 @@ func (rf *Raft) leaderRules() {
 func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DebugLog(dInfo, "S%d T:%d receive HBT from S%d T:%d",
-		rf.me, rf.currentTerm, args.C, args.Term)
+	DebugLog(dInfo, "S%d T:%d receive AE:%s.", rf.me, rf.currentTerm, args.String())
+
+	reply.Term = rf.currentTerm
+	reply.Success = false
+	// AppendEntries RPC, Receiver implementation
+	// Rule 1.
 	if args.Term < rf.currentTerm {
-		DebugLog(dDrop, "S%d drop HBT from S%d", rf.me, args.CandidateId)
+		DebugLog(dDrop, "S%d T:%d drop AE:%s", rf.me, rf.currentTerm)
 		return
 	}
 
-	rf.updateTerm(args.Term)
+	if args.Term > rf.currentTerm {
+		rf.updateTerm(args.Term)
+		DebugLog(dLog2, "S%d T:%d only update term from AE", rf.me, rf.currentTerm)
+		return // todo, why? need reset election timer?
+	}
+
 	rf.resetRandomizedElectionTimeout() // necessary, or 2A warning term changed
-	DebugLog(dInfo, "S%d T:%d received HBT from S%d T:%d, term updated",
-		rf.me, rf.currentTerm, args.CandidateId, args.Term)
+
+	// Rules for Servers, Candidate, Rule 3.
+	if rf.state == StateCandidate {
+		rf.state = StateFollower
+	}
+
+	// Rule 2.
+	if rf.log.lastLog().Index < args.PrevLogIndex {
+		reply.Conflict = true
+		reply.XTerm = -1
+		reply.XIndex = -1
+		reply.XLen = rf.log.len()
+		DebugLog(dLog2, "S%d T:%d AE conflict, reply(%+v)", rf.me, rf.currentTerm, reply)
+		return
+	}
+	if rf.log.at(args.PrevLogIndex).Term != args.PrevLogTerm {
+		reply.Conflict = true
+		xTerm := rf.log.at(args.PrevLogIndex).Term
+		for xIndex := args.PrevLogIndex; xIndex > 0; xIndex-- {
+			if rf.log.at(xIndex-1).Term != xTerm {
+				reply.XIndex = xIndex
+				break
+			} else {
+				DebugLog(dInfo, "S%d T:%d AE conflict, PrevLogIndex:%d, xIndex:%d, logTerm:%d, xTerm:%d",
+					rf.me, rf.currentTerm, args.PrevLogIndex, xIndex, rf.log.at(xIndex-1).Term, xTerm) // todo, delete
+			}
+		}
+		reply.XTerm = xTerm
+		reply.XLen = rf.log.len()
+		DebugLog(dLog2, "S%d T:%d AE conflict, reply(%+v)", rf.me, rf.currentTerm, reply)
+		return
+	}
+
+	for i, ent := range args.Entries {
+		// Rule 3.
+		if ent.Index <= rf.log.lastLog().Index && rf.log.at(ent.Index).Term != ent.Term {
+			rf.log.truncate(ent.Index)
+		}
+		// Rule 4.
+		if ent.Index > rf.log.lastLog().Index {
+			rf.log.append(args.Entries[i:]...)
+			DebugLog(dLog2, "S%d T:%d AE(%v)", rf.me, rf.currentTerm, args.Entries[i:])
+			break // todo, need or not?
+		}
+	}
+
+	// Rule 5.
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, rf.log.lastLog().Index)
+		rf.triggerApply()
+	}
+	reply.Success = true
+
+	DebugLog(dInfo, "S%d T:%d receive AE success, reply(%+v)", rf.me, rf.currentTerm, reply)
+	return
 }
 
 func (rf *Raft) sendEntry(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {

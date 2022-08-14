@@ -75,7 +75,8 @@ const (
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu sync.Mutex // Lock to protect shared access to this peer's state
+
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -106,6 +107,16 @@ type Raft struct {
 	// Volatile state on leaders:
 	nextIndex  []int
 	matchIndex []int
+
+	// Snapshot state
+	snapshot      []byte
+	snapshotIndex int
+	snapshotTerm  int
+
+	// Temporary location to give the service snapshot to the apply thread
+	waitingSnapshot []byte
+	waitingIndex    int // lastIncludedIndex
+	waitingTerm     int // lastIncludedTerm
 
 	// Others:
 	applyCh   chan ApplyMsg
@@ -226,16 +237,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Figure 2, RequestVote RPC, Receive implementation:
 	// Rule 1.
 	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		DebugLog(dDrop, "S%d T:%d, reject stale request T:%d",
 			rf.me, rf.currentTerm, args.Term)
 		return
 	}
 
+	// Rules for Servers, All Servers, #2
 	if args.Term > rf.currentTerm {
 		rf.updateTerm(args.Term)
 		old := rf.votedFor
-		rf.votedFor = args.CandidateId
+		rf.votedFor = args.CandidateId // todo, seems wrong
 		DebugLog(dVote, "S%d T:%d, change vote from S%d to S%d T:%d",
 			rf.me, rf.currentTerm, old, args.CandidateId, args.Term)
 	}
@@ -245,8 +258,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// Rule 2.
 		mine := rf.log.lastLog()
 		upToDate := args.LastLogTerm > mine.Term || (args.LastLogTerm == mine.Term && args.LastLogIndex >= mine.Index)
+		// haven't voted yet,
+		// or allow vote twice for the same candidate, but can't vote for any other candidate
 		if (rf.votedFor == InvalidId || rf.votedFor == args.CandidateId) && upToDate {
 			rf.votedFor = args.CandidateId
+			// todo, persist
 			rf.resetRandomizedElectionTimeout() // necessary, or 2A warning term changed
 			DebugLog(dVote, "S%d T:%d, vote for S%d T:%d",
 				rf.me, rf.currentTerm, args.CandidateId, args.Term)
@@ -271,6 +287,7 @@ func (rf *Raft) updateTerm(term int) {
 	rf.currentTerm = term
 	rf.state = StateFollower
 	rf.votedFor = InvalidId
+	// todo, persist
 	DebugLog(dTerm, "S%d update T:%d -> T:%d", rf.me, old, rf.currentTerm)
 }
 
@@ -375,9 +392,11 @@ func (rf *Raft) ticker() {
 
 		rf.mu.Lock()
 		if rf.state == StateLeader {
+			rf.resetRandomizedElectionTimeout()
 			rf.handleAppendEntries(true)
 		}
 		if time.Now().After(rf.randomizedElectionTimeout) {
+			rf.resetRandomizedElectionTimeout()
 			rf.campaign()
 		}
 		rf.mu.Unlock()
@@ -411,6 +430,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// 2B
 	rf.log = newLog()
+	rf.log.append(Entry{
+		Term:    0,
+		Index:   0,
+		Command: nil,
+	})
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.applyCh = applyCh
@@ -423,7 +447,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 
 	// 2B
-	go rf.handleApply()
+	go rf.handleApply() // thread that actually writes on the apply channel
 
 	return rf
 }
@@ -437,9 +461,8 @@ func (rf *Raft) campaign() {
 	rf.currentTerm++
 	rf.state = StateCandidate
 	rf.votedFor = rf.me
-	rf.resetRandomizedElectionTimeout()
 
-	voteCounter := 1
+	votes := 1 // count voted for myself
 	completed := false
 	args := RequestVoteArgs{
 		Term:        rf.currentTerm,
@@ -452,11 +475,11 @@ func (rf *Raft) campaign() {
 			continue
 		}
 
-		go rf.askForVote(peer, &args, &voteCounter, &completed)
+		go rf.askForVote(peer, &args, &votes, &completed)
 	}
 }
 
-func (rf *Raft) askForVote(to int, args *RequestVoteArgs, voteCounter *int, completed *bool) {
+func (rf *Raft) askForVote(to int, args *RequestVoteArgs, votes *int, completed *bool) {
 	DebugLog(dVote, "S%d asking for vote to S%d at T:%d", rf.me, to, args.Term)
 
 	var reply RequestVoteReply
@@ -489,41 +512,48 @@ func (rf *Raft) askForVote(to int, args *RequestVoteArgs, voteCounter *int, comp
 	DebugLog(dVote, "S%d T:%d grant vote to S%d T:%d",
 		to, reply.Term, rf.me, args.Term)
 
-	*voteCounter++
+	*votes++
 
-	if *voteCounter <= len(rf.peers)/2 {
-		DebugLog(dVote, "S%d got %d votes, not reach quorum yet", rf.me, voteCounter)
+	if *votes <= len(rf.peers)/2 {
+		DebugLog(dVote, "S%d got %d votes, not reach quorum yet", rf.me, *votes)
 		return
 	}
 	if *completed {
-		DebugLog(dVote, "S%d got %d votes, finish", rf.me, voteCounter)
+		DebugLog(dVote, "S%d got %d votes, finish", rf.me, *votes)
 		return
 	}
 
-	DebugLog(dVote, "S%d got quorum %d votes", rf.me, voteCounter)
+	DebugLog(dVote, "S%d got quorum %d votes", rf.me, *votes)
 	*completed = true
 
-	if args.Term != rf.currentTerm || rf.state != StateCandidate {
+	if args.Term != rf.currentTerm || rf.state != StateCandidate { // still current?
 		DebugLog(dWarn, "S%d T:[old:%d, now:%d] state:%d",
 			rf.me, args.Term, rf.currentTerm, rf.state)
 		return
 	}
 
+	rf.becomeLeaderL()
+	rf.handleAppendEntries(true)
+	DebugLog(dLeader, "S%d NI:%v", rf.me, rf.nextIndex)
+}
+
+func (rf *Raft) becomeLeaderL() {
+	DebugLog(dLeader, "S%d achieved majority for T:%d LI:%d, convert to Leader",
+		rf.me, rf.currentTerm, rf.log.lastLog().Index)
 	rf.state = StateLeader
-	DebugLog(dLeader, "S%d achieved majority for T%d(%d), convert to Leader(%d)",
-		rf.me, rf.currentTerm, voteCounter, rf.state)
 
 	// 2B
 	// Figure 2, State, Volatile state on leaders
 	// Reinitialized after election
 	last := rf.log.lastLog().Index
-	for i := range rf.peers {
+	for i := range rf.nextIndex {
+		// next index is just an optimistic guess;
+		// basically assuming that all the followers are up-to-date;
+		// we maybe initialize it too high for some followers,
+		// but we'll back up by the reply.
 		rf.nextIndex[i] = last + 1
 		rf.matchIndex[i] = -1 // Students' Guide
 	}
-	rf.handleAppendEntries(true)
-	DebugLog(dLeader, "S%d NI:%v", rf.me, rf.nextIndex)
-
 }
 
 // AppendEntriesArgs is from Figure 2
@@ -553,10 +583,10 @@ type AppendEntriesReply struct {
 	Success bool
 
 	// other fields for optimization
-	Conflict bool
-	XTerm    int
-	XIndex   int
-	XLen     int
+	ConflictValid bool
+	XTerm         int
+	XIndex        int
+	XLen          int
 }
 
 func (rf *Raft) handleAppendEntries(isHeart bool) {
@@ -571,29 +601,33 @@ func (rf *Raft) handleAppendEntries(isHeart bool) {
 
 	for peer, _ := range rf.peers {
 		if peer == rf.me {
-			rf.resetRandomizedElectionTimeout() // todo check need or not?
+			//rf.resetRandomizedElectionTimeout() // todo check need or not?
 			continue
 		}
 
 		// 2B
 		// Rules for Servers, Leaders
 		// Rule 3.
-		last := rf.log.lastLog().Index
-		next := rf.nextIndex[peer]
-		if last >= next || isHeart {
-			next = last
+		if rf.log.lastLog().Index > rf.nextIndex[peer] || isHeart {
+			next := rf.nextIndex[peer]
+			if next <= rf.log.startLog().Index { // <= because always skip entry "0"
+				next = rf.log.startLog().Index + 1
+			}
+			if next-1 > rf.log.lastLog().Index {
+				DebugLog(dLog2, "S%d T:%d, nextIndex[%d]=%d, index0=%d, lastIndex=%d",
+					rf.me, rf.currentTerm, peer, rf.nextIndex[peer], rf.log.startLog().Index, rf.log.lastLog().Index)
+				next = rf.log.lastLog().Index
+			}
 
-			prevLog := rf.log.at(next - 1)
 			args := AppendEntriesArgs{
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,
-				PrevLogIndex: prevLog.Index,
-				PrevLogTerm:  prevLog.Term,
-				Entries:      make([]Entry, last-next+1),
+				PrevLogIndex: next - 1,
+				PrevLogTerm:  rf.log.at(next - 1).Term,
+				Entries:      make([]Entry, rf.log.lastLog().Index-next+1),
 				LeaderCommit: rf.commitIndex,
 			}
 			copy(args.Entries, rf.log.slice(next))
-
 			go rf.tryAppendEntry(peer, &args, &failures, &completed)
 		}
 
@@ -610,13 +644,11 @@ func (rf *Raft) tryAppendEntry(to int, args *AppendEntriesArgs, failures *int, c
 	if !ok {
 		*failures++
 		if *failures <= len(rf.peers)/2 {
-			DebugLog(dError, "S%d lost connections with %d peers, it's ok",
-				rf.me, failures)
+			DebugLog(dError, "S%d lost connections with %d peers, it's ok", rf.me, failures)
 			return
 		}
 		if *completed {
-			DebugLog(dError, "S%d lost connections with %d peers, already known",
-				rf.me, failures)
+			DebugLog(dError, "S%d lost connections with %d peers, already known", rf.me, failures)
 			return
 		}
 		*completed = true
@@ -629,34 +661,44 @@ func (rf *Raft) tryAppendEntry(to int, args *AppendEntriesArgs, failures *int, c
 		return
 	}
 
-	// todo, check args term?
-	if reply.Success {
-		match := args.PrevLogIndex + len(args.Entries)
-		next := match + 1                                 // todo may not safe, from Students' Guide
-		rf.matchIndex[to] = max(rf.matchIndex[to], match) // increase monotonically
-		rf.nextIndex[to] = max(rf.nextIndex[to], next)    // increase monotonically
-		DebugLog(dLog2, "S%d T:%d AE success to S%d, MI:%d, NI:%d",
-			rf.me, rf.currentTerm, to, rf.matchIndex[to], rf.nextIndex[to])
-	} else if reply.Conflict {
-		DebugLog(dLog2, "S%d T:%d AE failed to S%d, reply conflict",
-			rf.me, rf.currentTerm, to)
-		if reply.XTerm == -1 { // todo, correct?
-			rf.nextIndex[to] = reply.XLen
-		} else {
-			li := rf.lastIndexMatchTerm(reply.XTerm)
-			DebugLog(dLog2, "S%d T:%d AE failed to S%d, reply hint LI:%d",
-				rf.me, rf.currentTerm, to, li)
-			if li > 0 {
-				rf.nextIndex[to] = li
+	if rf.currentTerm == args.Term {
+		// todo, move to a new func, processAppendReplyL()
+		if reply.Success {
+			next := args.PrevLogIndex + len(args.Entries) + 1
+			match := args.PrevLogIndex + len(args.Entries)
+			//match := args.PrevLogIndex + len(args.Entries)
+			//next := match + 1                                 // todo may not safe, from Students' Guide
+			rf.nextIndex[to] = max(rf.nextIndex[to], next)    // increase monotonically
+			rf.matchIndex[to] = max(rf.matchIndex[to], match) // increase monotonically
+			DebugLog(dLog2, "S%d T:%d AE success to S%d, MI:%d, NI:%d",
+				rf.me, rf.currentTerm, to, rf.matchIndex[to], rf.nextIndex[to])
+		} else if reply.ConflictValid {
+			// todo, split to function processConflictTermL()
+			// if there is conflict info, dealing with backoff fast
+			DebugLog(dLog2, "S%d T:%d AE failed to S%d, reply conflict", rf.me, rf.currentTerm, to)
+			if reply.XTerm == -1 { // todo, correct?
+				rf.nextIndex[to] = reply.XLen
 			} else {
-				rf.nextIndex[to] = reply.XIndex // todo, need investigate
+				li := rf.lastIndexMatchTerm(reply.XTerm)
+				DebugLog(dLog2, "S%d T:%d AE failed to S%d, reply hint LI:%d", rf.me, rf.currentTerm, to, li)
+				if li > 0 {
+					rf.nextIndex[to] = li
+				} else {
+					rf.nextIndex[to] = reply.XIndex // todo, need investigate
+				}
+			}
+			DebugLog(dLog2, "S%d T:%d update S%d NI:%d", rf.me, rf.currentTerm, to, rf.nextIndex[to])
+		} else if rf.nextIndex[to] > 1 {
+			// if no conflict info, just backoff by one
+			DebugLog(dLog2, "S%d T:%d AE backup by one", rf.me, rf.currentTerm)
+			rf.nextIndex[to] -= 1
+			if rf.nextIndex[to] < rf.log.startLog().Index+1 {
+				// todo, send snapshot
 			}
 		}
-		DebugLog(dLog2, "S%d T:%d update S%d NI:%d",
-			rf.me, rf.currentTerm, to, rf.nextIndex[to])
-	} // todo, need other condition?
+	}
 
-	rf.leaderRules()
+	rf.advanceCommitL() // leader rule
 }
 
 func (rf *Raft) lastIndexMatchTerm(t int) int {
@@ -672,37 +714,50 @@ func (rf *Raft) lastIndexMatchTerm(t int) int {
 	return -1
 }
 
-func (rf *Raft) leaderRules() {
-	// Rules for Servers, Leaders
-	// Rule 4:
+// Rules for Servers, Leaders
+func (rf *Raft) advanceCommitL() {
 	if rf.state != StateLeader {
+		DebugLog(dError, "advance commit, state:%d", rf.state)
 		return
 	}
 
-	total := 0 // todo, count myself or not?
+	start := rf.commitIndex + 1
+	if start < rf.log.startLog().Index { // on restart, start could be 1
+		start = rf.log.startLog().Index
+	}
 
-	for N := rf.commitIndex + 1; N <= rf.log.lastLog().Index; N++ {
-		if rf.log.at(N).Term != rf.currentTerm {
-			continue // shall log[N].term == currentTerm
+	for index := start; index <= rf.log.lastLog().Index; index++ {
+		// The scenario is that if you're a leader, you're not allowed
+		// to commit a previous term unless at least has committed one
+		// entry in its current term.
+		//
+		// It checks whether the current log entry that about to commit,
+		// has a term different from the current term,
+		// and if that's the case I'll just skip it.
+		if rf.log.at(index).Term != rf.currentTerm { // 5.4, figure 8.
+			continue
 		}
 
-		for to := 0; to < len(rf.peers); to++ {
-			if to == rf.me {
+		// Now happens if there's another log entry following that term,
+		// in the term for which I have a majority of the votes, then I'll
+		// commit that newer one, and then automatically logs will commit
+		// the previous one.
+		total := 1 // leader always matches
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
 				continue // skip myself
 			}
-
-			if rf.matchIndex[to] >= N {
+			if rf.matchIndex[i] >= index {
 				total++
 			}
 		}
-		if total > len(rf.peers)/2 {
-			rf.commitIndex = N
-			rf.triggerApply()
+		if total > len(rf.peers)/2 { // a majority?
+			rf.commitIndex = index
 			DebugLog(dLog2, "S%d T:%d update CI:%d and trigger apply",
 				rf.me, rf.currentTerm, rf.commitIndex)
-			return
 		}
 	}
+	rf.triggerApply()
 }
 
 // todo use append entry args and reply
@@ -735,7 +790,7 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 
 	// Rule 2.
 	if rf.log.lastLog().Index < args.PrevLogIndex {
-		reply.Conflict = true
+		reply.ConflictValid = true
 		reply.XTerm = -1
 		reply.XIndex = -1
 		reply.XLen = rf.log.len()
@@ -743,7 +798,7 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 		return
 	}
 	if rf.log.at(args.PrevLogIndex).Term != args.PrevLogTerm {
-		reply.Conflict = true
+		reply.ConflictValid = true
 		xTerm := rf.log.at(args.PrevLogIndex).Term
 		for xIndex := args.PrevLogIndex; xIndex > 0; xIndex-- {
 			if rf.log.at(xIndex-1).Term != xTerm {

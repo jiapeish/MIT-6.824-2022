@@ -17,6 +17,17 @@ func newLog() *raftLog {
 	}
 }
 
+func (l *raftLog) startLog() *Entry {
+	return l.at(0)
+}
+
+func (l *raftLog) lastLog() *Entry {
+	if l.len() == 0 {
+		return nil
+	}
+	return l.at(l.len() - 1)
+}
+
 func (l *raftLog) append(ents ...Entry) {
 	l.Entries = append(l.Entries, ents...)
 }
@@ -27,10 +38,6 @@ func (l *raftLog) at(index int) *Entry {
 
 func (l *raftLog) len() int {
 	return len(l.Entries)
-}
-
-func (l *raftLog) lastLog() *Entry {
-	return l.at(l.len() - 1)
 }
 
 func (l *raftLog) slice(index int) []Entry {

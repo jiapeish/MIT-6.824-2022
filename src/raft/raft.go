@@ -228,7 +228,7 @@ type RequestVoteReply struct {
 
 //
 // RequestVote RPC handler example.
-//
+//[
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
@@ -237,45 +237,36 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Figure 2, RequestVote RPC, Receive implementation:
 	// Rule 1.
 	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
-		DebugLog(dDrop, "S%d T:%d, reject stale request T:%d",
-			rf.me, rf.currentTerm, args.Term)
+		reply.Term = rf.currentTerm
+		DebugLog(dDrop, "S%d T:%d, reject stale request from S%d T:%d", rf.me, rf.currentTerm, args.CandidateId, args.Term)
 		return
 	}
 
 	// Rules for Servers, All Servers, #2
 	if args.Term > rf.currentTerm {
 		rf.updateTerm(args.Term)
-		old := rf.votedFor
-		rf.votedFor = args.CandidateId // todo, seems wrong
-		DebugLog(dVote, "S%d T:%d, change vote from S%d to S%d T:%d",
-			rf.me, rf.currentTerm, old, args.CandidateId, args.Term)
 	}
 
-	if args.Term == rf.currentTerm {
-		// Figure 2, RequestVote RPC, Receive implementation:
-		// Rule 2.
-		mine := rf.log.lastLog()
-		upToDate := args.LastLogTerm > mine.Term || (args.LastLogTerm == mine.Term && args.LastLogIndex >= mine.Index)
-		// haven't voted yet,
-		// or allow vote twice for the same candidate, but can't vote for any other candidate
-		if (rf.votedFor == InvalidId || rf.votedFor == args.CandidateId) && upToDate {
-			rf.votedFor = args.CandidateId
-			// todo, persist
-			rf.resetRandomizedElectionTimeout() // necessary, or 2A warning term changed
-			DebugLog(dVote, "S%d T:%d, vote for S%d T:%d",
-				rf.me, rf.currentTerm, args.CandidateId, args.Term)
-		} else {
-			DebugLog(dVote, "S%d T:%d, already voted for S%d, reject S%d T:%d",
-				rf.me, rf.currentTerm, rf.votedFor, args.CandidateId, args.Term)
-		}
+	// Figure 2, RequestVote RPC, Receive implementation:
+	// Rule 2.
+	mine := rf.log.lastLog()
+	upToDate := args.LastLogTerm > mine.Term || (args.LastLogTerm == mine.Term && args.LastLogIndex >= mine.Index)
+	// haven't voted yet,
+	// or allow vote twice for the same candidate, but can't vote for any other candidate
+	if (rf.votedFor == InvalidId || rf.votedFor == args.CandidateId) && upToDate {
+		reply.VoteGranted = true
+		rf.votedFor = args.CandidateId
+		// todo, persist
+		rf.resetRandomizedElectionTimeout() // necessary, or 2A warning term changed
+		DebugLog(dVote, "S%d T:%d, grant vote to S%d T:%d", rf.me, rf.currentTerm, args.CandidateId, args.Term)
+	} else {
+		reply.VoteGranted = false
+		DebugLog(dVote, "S%d T:%d, already voted for S%d, reject S%d T:%d",
+			rf.me, rf.currentTerm, rf.votedFor, args.CandidateId, args.Term)
 	}
 
 	reply.Term = rf.currentTerm
-	reply.VoteGranted = rf.votedFor == args.CandidateId
-	DebugLog(dInfo, "S%d T:%d, request vote reply T:%d voted:%v",
-		rf.me, rf.currentTerm, reply.Term, reply.VoteGranted)
 }
 
 func (rf *Raft) updateTerm(term int) {
@@ -461,16 +452,17 @@ func (rf *Raft) resetRandomizedElectionTimeout() {
 }
 
 func (rf *Raft) campaign() {
-	rf.currentTerm++
+	rf.currentTerm += 1 // Rule for Candidate
 	rf.state = StateCandidate
-	rf.votedFor = rf.me
 
-	votes := 1 // count voted for myself
-	completed := false
+	rf.votedFor = rf.me // Rule for Candidate
+	// todo, persist
+
 	args := RequestVoteArgs{
 		Term:        rf.currentTerm,
 		CandidateId: rf.me,
 	}
+	votes := 1 // count voted for myself
 	DebugLog(dInfo, "S%d create campaign, T:%d", rf.me, rf.currentTerm)
 
 	for peer, _ := range rf.peers {
@@ -478,11 +470,11 @@ func (rf *Raft) campaign() {
 			continue
 		}
 
-		go rf.askForVote(peer, &args, &votes, &completed)
+		go rf.askForVote(peer, &args, &votes)
 	}
 }
 
-func (rf *Raft) askForVote(to int, args *RequestVoteArgs, votes *int, completed *bool) {
+func (rf *Raft) askForVote(to int, args *RequestVoteArgs, votes *int) {
 	DebugLog(dVote, "S%d asking for vote to S%d at T:%d", rf.me, to, args.Term)
 
 	var reply RequestVoteReply
@@ -495,53 +487,30 @@ func (rf *Raft) askForVote(to int, args *RequestVoteArgs, votes *int, completed 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	DebugLog(dInfo, "S%d T:%d receive vote-reply from S%d T:%d",
-		rf.me, args.Term, to, reply.Term)
-	if !reply.VoteGranted {
-		DebugLog(dVote, "S%d reject vote to S%d", to, rf.me)
-		return
-	}
-	if reply.Term < args.Term {
-		DebugLog(dVote, "S%d T:%d got stale vote from S%d T:%d",
-			rf.me, args.Term, to, reply.Term)
-		return
-	}
-	if reply.Term > args.Term {
-		DebugLog(dVote, "S%d T:%d grant vote to S%d T:%d, update term",
-			to, reply.Term, rf.me, args.Term)
+	DebugLog(dInfo, "S%d T:%d argT:%d receive vote-reply from S%d T:%d", rf.me, rf.currentTerm, args.Term, to, reply.Term)
+
+	if reply.Term > rf.currentTerm {
 		rf.updateTerm(reply.Term)
-		return // todo return or not, how to wait every goroutine finish?
 	}
-	DebugLog(dVote, "S%d T:%d grant vote to S%d T:%d",
-		to, reply.Term, rf.me, args.Term)
 
-	*votes++
-
-	if *votes <= len(rf.peers)/2 {
-		DebugLog(dVote, "S%d got %d votes, not reach quorum yet", rf.me, *votes)
-		return
-	}
-	if *completed {
-		DebugLog(dVote, "S%d got %d votes, finish", rf.me, *votes)
+	if !reply.VoteGranted {
+		DebugLog(dVote, "S%d receive reject vote from S%d", rf.me, to)
 		return
 	}
 
-	DebugLog(dVote, "S%d got quorum %d votes", rf.me, *votes)
-	*completed = true
-
-	if args.Term != rf.currentTerm || rf.state != StateCandidate { // still current?
-		DebugLog(dWarn, "S%d T:[old:%d, now:%d] state:%d",
-			rf.me, args.Term, rf.currentTerm, rf.state)
-		return
+	*votes += 1
+	if *votes > len(rf.peers)/2 {
+		DebugLog(dVote, "S%d got quorum %d votes", rf.me, *votes)
+		if rf.currentTerm == args.Term {
+			rf.becomeLeaderL()
+			rf.handleAppendEntries(true)
+			DebugLog(dLeader, "S%d NI:%v", rf.me, rf.nextIndex)
+		}
 	}
-
-	rf.becomeLeaderL()
-	rf.handleAppendEntries(true)
-	DebugLog(dLeader, "S%d NI:%v", rf.me, rf.nextIndex)
 }
 
 func (rf *Raft) becomeLeaderL() {
-	DebugLog(dLeader, "S%d achieved majority for T:%d LI:%d, convert to Leader",
+	DebugLog(dLeader, "S%d T:%d achieved majority with LI:%d, convert to Leader",
 		rf.me, rf.currentTerm, rf.log.lastLog().Index)
 	rf.state = StateLeader
 
@@ -577,7 +546,7 @@ func (a AppendEntriesArgs) String() string {
 	}
 	entries := strings.Join(ents, ",")
 
-	return fmt.Sprintf("AEArg[Leader:%d, T:%d, PLI:%d, PLT:%d, LCI:%d, Ents:%s]",
+	return fmt.Sprintf("Arg[Leader:%d, T:%d, PLI:%d, PLT:%d, LCI:%d, Ents:%s]",
 		a.LeaderId, a.Term, a.PrevLogIndex, a.PrevLogTerm, a.LeaderCommit, entries)
 }
 
@@ -774,7 +743,7 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 	// AppendEntries RPC, Receiver implementation
 	// Rule 1.
 	if args.Term < rf.currentTerm {
-		DebugLog(dDrop, "S%d T:%d drop AE:%s", rf.me, rf.currentTerm)
+		DebugLog(dDrop, "S%d T:%d drop AE:%s", rf.me, rf.currentTerm, args.String())
 		return
 	}
 

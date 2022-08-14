@@ -343,21 +343,24 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	if rf.state != StateLeader {
-		return rf.commitIndex, rf.currentTerm, false // todo -1?
+		return -1, rf.currentTerm, false // todo -1?
 	}
-	index := rf.log.lastLog().Index
-	term := rf.currentTerm
+
 	ent := Entry{
-		Term:    term,
-		Index:   index,
+		Term: rf.currentTerm,
+		//Index:   index,
 		Command: command,
 	}
+	index := rf.log.lastLog().Index + 1
 	rf.log.append(ent)
-	rf.handleAppendEntries(false)
-	DebugLog(dLog, "S%d start, T:%d I:%d Entry:%v", rf.me, term, index, ent)
+	// todo, persist
 
-	return index, term, true
+	rf.handleAppendEntries(false)
+	DebugLog(dLog, "S%d start, T:%d I:%d Entry:%v", rf.me, rf.currentTerm, index, ent)
+
+	return index, rf.currentTerm, true
 }
 
 // Kill is used for:
@@ -644,11 +647,11 @@ func (rf *Raft) tryAppendEntry(to int, args *AppendEntriesArgs, failures *int, c
 	if !ok {
 		*failures++
 		if *failures <= len(rf.peers)/2 {
-			DebugLog(dError, "S%d lost connections with %d peers, it's ok", rf.me, failures)
+			DebugLog(dError, "S%d lost connections with %d peers, it's ok", rf.me, *failures)
 			return
 		}
 		if *completed {
-			DebugLog(dError, "S%d lost connections with %d peers, already known", rf.me, failures)
+			DebugLog(dError, "S%d lost connections with %d peers, already known", rf.me, *failures)
 			return
 		}
 		*completed = true
@@ -848,22 +851,50 @@ func (rf *Raft) handleApply() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	rf.lastApplied = 0
+
+	if rf.lastApplied+1 <= rf.log.startLog().Index {
+		//rf.lastApplied = rf.log.startLog().Index // todo, restart from a snapshot
+	}
+
 	for !rf.killed() {
+		//if rf.waitingSnapshot != nil {
+		//	am := ApplyMsg{}
+		//	DebugLog(dSnap, "S%d T:%d deliver snapshot", rf.me, rf.currentTerm)
+		//	am.SnapshotValid = true
+		//	am.Snapshot = rf.waitingSnapshot
+		//	am.SnapshotIndex = rf.waitingIndex
+		//	am.SnapshotTerm = rf.waitingTerm
+		//
+		//	rf.waitingSnapshot = nil
+		//
+		//	rf.mu.Unlock()
+		//	rf.applyCh <- am
+		//	rf.mu.Lock()
+		//} else
+
 		// Figure 2, Rules for Servers, All Servers, #1
-		if rf.commitIndex > rf.lastApplied {
-			rf.lastApplied++
+		if rf.lastApplied+1 <= rf.commitIndex &&
+			rf.lastApplied+1 <= rf.log.lastLog().Index &&
+			rf.lastApplied+1 > rf.log.startLog().Index { // Rules for All Servers
+			rf.lastApplied += 1
 			am := ApplyMsg{
 				CommandValid: true,
 				Command:      rf.log.at(rf.lastApplied).Command,
 				CommandIndex: rf.lastApplied,
 			}
-			DebugLog(dLog2, "S%d apply I:%d, applied cmds(%v)", rf.me, rf.lastApplied, rf.getAppliedCmds())
-			rf.applyCh <- am // todo blocked?
+			DebugLog(dLog2, "S%d applier deliver I:%d, applied cmds(%v)", rf.me, am.CommandIndex, rf.getAppliedCmds())
+
+			// unlock before writing to the apply channel
+			rf.mu.Unlock()
+			rf.applyCh <- am
+			rf.mu.Lock()
 			DebugLog(dLog2, "S%d apply msg sent to chan", rf.me)
 
 		} else {
+			// if there is nothing more to apply, wait on the condition
+			DebugLog(dLog2, "S%d applier wait cond", rf.me)
 			rf.applyCond.Wait() // todo why?
-			DebugLog(dLog2, "S%d wait apply cond", rf.me)
 		}
 
 	}

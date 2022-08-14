@@ -7,12 +7,22 @@ import (
 
 type raftLog struct {
 	Entries []Entry
-	Index0  int
+
+	// for 2D, when you're gonna cut up beginning of the log, this global log,
+	// You need to keep track of the index of the first entry recorded in
+	// the log.
+	//
+	// for example, you take a snapshot at index 10, you're gonna cut 0-9,
+	// and index0 will be 10. So this means the end of the snapshot, not in
+	// the log anymore.
+	//
+	// in 2A, 2B, 2C, index0 will always be 0.
+	Index0 int
 }
 
 func newLog() *raftLog {
 	return &raftLog{
-		Entries: make([]Entry, 0),
+		Entries: make([]Entry, 1),
 		Index0:  0,
 	}
 }
